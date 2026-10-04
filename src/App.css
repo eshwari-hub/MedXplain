@@ -2994,3 +2994,94 @@
   }
 }
 
+/* ==========================================================================
+   Zero-Abnormalities & Top Model Candidates Styling
+   ========================================================================== */
+.no-abnormalities-card {
+  background: rgba(16, 185, 129, 0.05);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  transition: all var(--transition-normal);
+}
+
+.no-abnormalities-card:hover {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.4);
+}
+
+.no-abn-icon-circle {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(16, 185, 129, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.top-candidates-section {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.candidate-item-card {
+  background: rgba(8, 14, 28, 0.6);
+  border: 1px solid var(--border-subtle);
+  transition: all var(--transition-fast);
+}
+
+.candidate-item-card:hover {
+  background: rgba(15, 23, 42, 0.8);
+  border-color: rgba(6, 182, 212, 0.3);
+}
+
+.badge-below-thresh {
+  background: rgba(148, 163, 184, 0.12);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.candidate-meter-track {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 3px;
+  overflow: visible;
+}
+
+.candidate-meter-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.6s ease;
+}
+
+.candidate-meter-fill.sub-thresh {
+  background: linear-gradient(90deg, rgba(6, 182, 212, 0.5) 0%, rgba(56, 189, 248, 0.7) 100%);
+}
+
+.candidate-threshold-marker {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 12px;
+  background: #f59e0b;
+  box-shadow: 0 0 6px rgba(245, 158, 11, 0.6);
+  z-index: 2;
+}
+
+/* Model Attention Visualization Notice */
+.attention-visualization-notice {
+  background: rgba(6, 182, 212, 0.06);
+  border: 1px solid rgba(6, 182, 212, 0.3);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+}
+
+.notice-icon-box {
+  background: rgba(6, 182, 212, 0.12);
+  border: 1px solid rgba(6, 182, 212, 0.25);
+}
+
+/* Explainability Specs Grid */
+.xai-specs-grid {
+  border-radius: 8px;
+}
+

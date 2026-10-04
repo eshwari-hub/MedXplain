@@ -30,19 +30,24 @@ export function ExplainableAIView({ analysisResult }) {
 
   const isDemo = analysisResult?.isDemoMode || analysisResult?.source === 'demo-simulation';
   const hasRealGradcam = Boolean(analysisResult?.grad_cam_image);
+  const hasZeroAbnormalities = !analysisResult?.abnormalities || analysisResult.abnormalities.length === 0;
+  const topCandidates = analysisResult?.top_predictions || analysisResult?.topPredictions || [];
 
-  const abnormalities = (analysisResult?.abnormalities && analysisResult.abnormalities.length > 0)
+  // Items for selector: detected abnormalities if any, otherwise top model candidates
+  const displayItems = (!hasZeroAbnormalities && analysisResult?.abnormalities?.length > 0)
     ? analysisResult.abnormalities
-    : [
+    : (topCandidates.length > 0 ? topCandidates : [
         {
-          name: 'Under Evaluation',
+          name: analysisResult?.grad_cam_target || 'Candidate',
           confidence: 0,
-          region: 'Pending model analysis',
-          clinicalReasoning: 'Awaiting model inference from Flask backend.'
+          threshold: 50,
+          region: 'Anatomical focus zone',
+          clinicalReasoning: 'Visualization shows where the neural network focused its gradient attention.'
         }
-      ];
+      ]);
 
-  const currentAbnormality = abnormalities[selectedAbnormalityIndex] || abnormalities[0];
+  const currentItem = displayItems[selectedAbnormalityIndex] || displayItems[0];
+  const targetClass = analysisResult?.grad_cam_target || currentItem.name;
   const imageUrl = analysisResult?.imageUrl || '/assets/brain-sample.jpg';
 
   // In DEMO mode only, procedural canvas simulates heatmaps for UI validation.
@@ -65,7 +70,7 @@ export function ExplainableAIView({ analysisResult }) {
     if (!imageObjRef.current || !isDemo) return;
 
     const renderOpts = {
-      centroid: currentAbnormality.heatCentroid || { x: 0.5, y: 0.5, radius: 0.22 },
+      centroid: currentItem.heatCentroid || { x: 0.5, y: 0.5, radius: 0.22 },
       opacity: opacity,
       colormap: colormap,
       showBBox: showBoundingBox,
@@ -100,27 +105,58 @@ export function ExplainableAIView({ analysisResult }) {
             Grad-CAM <span className="gradient-text">Visual Explainability</span>
           </h2>
           <p className="section-desc">
-            Visualizing gradient attribution from the DenseNet121 final convolutional stage (<code>conv5_block16_2_conv</code>) to explain why the model made each prediction.
+            Visualizing gradient attribution from the DenseNet121 final convolutional stage (<code>conv5_block16_2_conv</code>) to explain where the model focused for each organ and pathology.
           </p>
         </div>
 
-        {/* Abnormality Target Selector (Multi-Label Switcher) */}
+        {/* Prominent Attention Notice when zero abnormalities cross threshold */}
+        {hasZeroAbnormalities && (
+          <div className="attention-visualization-notice glass-panel mb-5 p-4 rounded-xl border border-cyan/30">
+            <div className="flex items-start gap-3">
+              <div className="notice-icon-box p-2 rounded-lg bg-cyan/10 text-cyan">
+                <Info size={22} />
+              </div>
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <h3 className="font-mono text-sm font-bold text-cyan uppercase tracking-wide">
+                    Model Attention Visualization
+                  </h3>
+                  <span className="badge badge-warning text-xs mono">
+                    Below diagnostic threshold
+                  </span>
+                </div>
+                <p className="text-sm text-primary font-medium mt-1">
+                  This visualization shows where the model focused. It is not a confirmed medical diagnosis.
+                </p>
+                <p className="text-xs text-secondary mt-1">
+                  No pathology crossed the calibrated diagnostic threshold. Grad-CAM targeted the highest-probability candidate class (<strong>{targetClass}</strong>) to visualize network gradient salience.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Abnormality / Candidate Target Selector (Multi-Label Switcher) */}
         <div className="xai-abnormality-tabs glass-card-static">
           <span className="tabs-header-label mono uppercase text-xs text-muted">
-            Inspect Class Activation:
+            {hasZeroAbnormalities ? 'Inspect Candidate Activation:' : 'Inspect Class Activation:'}
           </span>
           <div className="xai-tabs-container">
-            {abnormalities.map((abn, idx) => {
-              const confVal = typeof abn.confidence === 'number' ? abn.confidence : 0;
+            {displayItems.map((item, idx) => {
+              const confVal = typeof item.confidence === 'number' ? item.confidence : 0;
+              const isTarget = item.name === targetClass || (idx === 0 && !hasZeroAbnormalities);
               return (
                 <button
-                  key={abn.id || idx}
+                  key={item.id || idx}
                   className={`xai-tab-btn ${selectedAbnormalityIndex === idx ? 'active' : ''}`}
                   onClick={() => setSelectedAbnormalityIndex(idx)}
                 >
                   <Flame size={15} className={selectedAbnormalityIndex === idx ? 'text-cyan' : 'text-muted'} />
-                  <span className="font-semibold">{abn.name}</span>
+                  <span className="font-semibold">{item.name}</span>
                   <span className="badge badge-cyan mono text-xs">{confVal.toFixed(1)}%</span>
+                  {hasZeroAbnormalities && (
+                    <span className="text-[10px] text-muted mono hidden sm:inline">(Candidate)</span>
+                  )}
                 </button>
               );
             })}
@@ -333,31 +369,84 @@ export function ExplainableAIView({ analysisResult }) {
 
           {/* Right Column: In-Depth Explanation & Model Rationale */}
           <div className="xai-explanation-sidebar">
-            {/* Primary Finding Card */}
+            {/* Dedicated Diagnostic Specs Card: XAI PROTOCOL, TARGET, TARGET LAYER */}
+            <div className="xai-card glass-panel mb-4">
+              <div className="xai-card-header">
+                <div className="header-icon-box">
+                  <Eye size={20} className="text-cyan" />
+                </div>
+                <div>
+                  <span className="text-xs text-muted mono uppercase">Explainability Protocol</span>
+                  <h3 className="xai-finding-title">Grad-CAM Inferences</h3>
+                </div>
+              </div>
+
+              <div className="xai-specs-grid mt-3 space-y-2 text-xs">
+                <div className="flex justify-between items-center py-1.5 border-b border-glass">
+                  <span className="text-muted font-mono uppercase">XAI PROTOCOL</span>
+                  <span className="font-bold text-cyan font-mono">Grad-CAM</span>
+                </div>
+                <div className="flex justify-between items-center py-1.5 border-b border-glass">
+                  <span className="text-muted font-mono uppercase">TARGET</span>
+                  <span className="font-bold text-primary font-mono">{targetClass}</span>
+                </div>
+                <div className="flex justify-between items-center py-1.5 border-b border-glass">
+                  <span className="text-muted font-mono uppercase">TARGET LAYER</span>
+                  <code className="text-cyan font-mono font-bold bg-cyan/10 px-1.5 py-0.5 rounded">
+                    {analysisResult?.grad_cam_layer || 'conv5_block16_2_conv'}
+                  </code>
+                </div>
+                <div className="flex justify-between items-center py-1.5 border-b border-glass">
+                  <span className="text-muted font-mono uppercase">DIAGNOSTIC STATUS</span>
+                  <span className={`badge ${hasZeroAbnormalities ? 'badge-below-thresh' : 'badge-urgent'} text-[11px] mono`}>
+                    {hasZeroAbnormalities ? 'Below diagnostic threshold' : 'Confirmed Abnormality'}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Primary Finding / Target Focus Card */}
             <div className="xai-card glass-panel">
               <div className="xai-card-header">
                 <div className="header-icon-box">
                   <Sparkles size={20} className="text-cyan" />
                 </div>
                 <div>
-                  <span className="text-xs text-muted mono uppercase">Focused Abnormality</span>
-                  <h3 className="xai-finding-title">{currentAbnormality.name}</h3>
+                  <span className="text-xs text-muted mono uppercase">
+                    {hasZeroAbnormalities ? 'Attention Focus Class' : 'Focused Abnormality'}
+                  </span>
+                  <h3 className="xai-finding-title">{currentItem.name}</h3>
                 </div>
               </div>
 
               <div className="finding-meta-row mt-3">
                 <div className="meta-box">
-                  <span className="lbl text-muted text-xs">Model Confidence</span>
+                  <span className="lbl text-muted text-xs">Model Probability</span>
                   <span className="val mono text-lg text-cyan font-bold">
-                    {(typeof currentAbnormality.confidence === 'number' ? currentAbnormality.confidence : 0).toFixed(1)}%
+                    {(typeof currentItem.confidence === 'number' ? currentItem.confidence : 0).toFixed(1)}%
                   </span>
                 </div>
                 <div className="meta-box">
-                  <span className="lbl text-muted text-xs">Disease Stage</span>
-                  <span className="val text-sm font-semibold text-primary">
-                    {currentAbnormality.stage || analysisResult?.diseaseStage || 'Not available'}
+                  <span className="lbl text-muted text-xs">Calibrated Threshold</span>
+                  <span className="val mono text-sm font-semibold text-primary">
+                    {(typeof currentItem.threshold === 'number' ? currentItem.threshold : 50).toFixed(1)}%
                   </span>
                 </div>
+              </div>
+
+              {/* Status Note */}
+              <div className="mt-3 p-2.5 rounded-lg bg-glass text-xs">
+                {hasZeroAbnormalities ? (
+                  <p className="text-secondary leading-relaxed">
+                    <strong className="text-cyan font-mono uppercase block mb-0.5">Model Attention Visualization</strong>
+                    This visualization shows where the model focused. It is not a confirmed medical diagnosis. Probability is below the diagnostic threshold.
+                  </p>
+                ) : (
+                  <p className="text-secondary leading-relaxed">
+                    <strong className="text-cyan font-mono uppercase block mb-0.5">Confirmed Neural Salience</strong>
+                    Grad-CAM highlights localized spatial regions that contributed positively to this detected pathology classification.
+                  </p>
+                )}
               </div>
 
               {/* Affected Anatomical Region */}
@@ -366,19 +455,19 @@ export function ExplainableAIView({ analysisResult }) {
                   Affected Anatomical Region:
                 </span>
                 <div className="site-val font-semibold text-primary mt-1">
-                  {currentAbnormality.region || currentAbnormality.affectedRegion || 'Not specified'}
+                  {currentItem.region || currentItem.affectedRegion || `${analysisResult?.organ || 'Organ'} focus region`}
                 </div>
               </div>
 
               {/* Why the Model Made the Prediction */}
               <div className="reasoning-box mt-4">
                 <span className="reasoning-lbl mono text-xs uppercase text-cyan">
-                  Simple Explanation of Prediction:
+                  Neural Explanation:
                 </span>
                 <p className="reasoning-text text-sm text-secondary mt-1">
-                  {currentAbnormality.clinicalReasoning || (
-                    isDemo 
-                      ? 'Simulated feature activation in DenseNet121 final block highlights salient anatomical morphology.'
+                  {currentItem.clinicalReasoning || (
+                    hasZeroAbnormalities
+                      ? `Gradient flow with respect to '${targetClass}' focuses on key anatomical landmarks in the ${analysisResult?.organ || 'organ'} scan.`
                       : 'The neural network focused its gradient attention on specific radiological patterns corresponding to this class.'
                   )}
                 </p>
@@ -386,7 +475,7 @@ export function ExplainableAIView({ analysisResult }) {
             </div>
 
             {/* Grad-CAM Theory & Formula Box */}
-            <div className="xai-card glass-panel tech-formula-card">
+            <div className="xai-card glass-panel tech-formula-card mt-4">
               <h4 className="formula-card-title mono text-xs uppercase text-cyan">
                 Grad-CAM Mathematical Foundation
               </h4>
@@ -402,7 +491,8 @@ export function ExplainableAIView({ analysisResult }) {
 
               <div className="formula-footer text-xs text-muted mt-2">
                 <CheckCircle2 size={13} className="text-normal inline mr-1" />
-                Target layer: <code>conv5_block16_2_conv</code>
+                Target layer: <code>{analysisResult?.grad_cam_layer || 'conv5_block16_2_conv'}</code>
+                <span className="ml-2 text-cyan">| Target: <strong>{targetClass}</strong></span>
               </div>
             </div>
           </div>

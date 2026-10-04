@@ -22,7 +22,9 @@ import time
 import os
 import io
 import csv
+import base64
 import numpy as np
+import matplotlib.cm as cm
 from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -32,37 +34,50 @@ import keras
 
 app = Flask(__name__)
 
-# Configure CORS so Vite frontend (localhost:5174 / localhost:5173 / localhost:5175) can communicate
+# Configure CORS: support environment-driven origins for public production deployments
+cors_origins_env = os.environ.get('CORS_ORIGINS') or os.environ.get('FRONTEND_URL')
+if cors_origins_env:
+    allowed_origins = [orig.strip() for orig in cors_origins_env.split(',') if orig.strip()]
+else:
+    allowed_origins = [
+        "http://localhost:5175",
+        "http://localhost:5174",
+        "http://localhost:5173",
+        "http://127.0.0.1:5175",
+        "http://127.0.0.1:5174",
+        "http://127.0.0.1:5173",
+        "*"
+    ]
+
 CORS(app, resources={
     r"/api/*": {
-        "origins": [
-            "http://localhost:5175",
-            "http://localhost:5174",
-            "http://localhost:5173",
-            "http://127.0.0.1:5175",
-            "http://127.0.0.1:5174",
-            "http://127.0.0.1:5173",
-            "*"
-        ],
+        "origins": allowed_origins,
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
 })
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp', 'tiff', 'tif', 'bmp', 'dcm'}
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB max upload size
 
-# Model & Thresholds Path Resolution
+# Model & Thresholds Path Resolution (Environment-based & Relative)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.abspath(os.path.join(BASE_DIR, '..'))
 
 MODEL_CANDIDATES = [
+    os.environ.get('MODEL_PATH'),
     os.path.join(PROJECT_DIR, 'models', 'best_densenet121.keras'),
+    os.path.join(BASE_DIR, 'models', 'best_densenet121.keras'),
+    os.path.join('models', 'best_densenet121.keras'),
     r'C:\Users\User\OneDrive\Desktop\models\best_densenet121.keras',
     r'C:\Users\User\Downloads\best_densenet121.keras'
 ]
 
 THRESHOLDS_CANDIDATES = [
+    os.environ.get('THRESHOLDS_PATH'),
     os.path.join(PROJECT_DIR, 'models', 'optimal_thresholds.csv'),
+    os.path.join(BASE_DIR, 'models', 'optimal_thresholds.csv'),
+    os.path.join('models', 'optimal_thresholds.csv'),
     r'C:\Users\User\OneDrive\Desktop\models\optimal_thresholds.csv',
     os.path.join(PROJECT_DIR, 'models', 'optimal_thresholds.txt'),
     r'C:\Users\User\OneDrive\Desktop\models\optimal_thresholds.txt',
@@ -72,6 +87,8 @@ THRESHOLDS_CANDIDATES = [
 
 MODEL = None
 MODEL_PATH_LOADED = None
+GRAD_CAM_MODEL = None
+TARGET_LAYER_NAME = 'conv5_block16_2_conv'
 LABELS_DATA = []  # List of tuples: (label_name, threshold_float) in exact 60-order
 LABELS_DICT = {}  # label_name -> threshold_float
 
@@ -97,7 +114,7 @@ def load_thresholds(csv_path):
     return labels
 
 def init_model():
-    global MODEL, MODEL_PATH_LOADED, LABELS_DATA, LABELS_DICT
+    global MODEL, MODEL_PATH_LOADED, LABELS_DATA, LABELS_DICT, GRAD_CAM_MODEL
     model_file = resolve_file(MODEL_CANDIDATES)
     thresh_file = resolve_file(THRESHOLDS_CANDIDATES)
 
@@ -120,11 +137,25 @@ def init_model():
         MODEL_PATH_LOADED = model_file
         print(f"[INIT] Model loaded successfully in {time.time()-t0:.2f}s!")
         print(f"[INIT] Input shape: {MODEL.input_shape}, Output shape: {MODEL.output_shape}")
+
+        # Construct and cache the Grad-CAM sub-model targeting conv5_block16_2_conv
+        try:
+            dense_sub = MODEL.get_layer('densenet121')
+            target_conv = dense_sub.get_layer(TARGET_LAYER_NAME)
+            GRAD_CAM_MODEL = keras.models.Model(
+                inputs=dense_sub.input,
+                outputs=[target_conv.output, dense_sub.output]
+            )
+            print(f"[INIT] Grad-CAM model created targeting layer '{TARGET_LAYER_NAME}' (output shape: {target_conv.output.shape})!")
+        except Exception as e_cam:
+            print(f"[WARNING] Could not initialize Grad-CAM sub-model: {e_cam}")
+            GRAD_CAM_MODEL = None
     except Exception as e:
         print(f"[ERROR] Failed to load model: {e}")
         MODEL = None
+        GRAD_CAM_MODEL = None
 
-# Initialize model and thresholds once at server startup
+# Initialize model, thresholds, and Grad-CAM sub-model once at server startup
 init_model()
 
 # =========================================================================
@@ -224,7 +255,7 @@ def analyze_modality_organ(pil_img):
 
     # If not a monochromatic medical scan or contrast is too low
     if color_diff > 4.5 or dynamic_range < 0.25 or std_val < 0.04:
-        return None, 0.0, None, "Unable to confidently determine whether this is a Brain MRI, Chest X-Ray, or Bone X-Ray. Please upload a supported medical scan."
+        return None, 0.0, None, [], "Unable to confidently determine whether the image is a supported Brain MRI, Chest X-Ray, or Bone X-Ray."
 
     # --- Feature Measurements ---
     # 1. Outer margins and corners
@@ -300,6 +331,8 @@ def analyze_modality_organ(pil_img):
         bm_score -= 5.0
     if border_mean > 0.22:
         bm_score -= 5.0
+    if dark_space_frac > 0.65:
+        bm_score -= 4.0
 
     # Chest X-Ray Rules
     cxr_score = 0.0
@@ -325,18 +358,22 @@ def analyze_modality_organ(pil_img):
     bx_score = 0.0
     if dark_space_frac > 0.50:
         bx_score += 3.5
+    if dark_space_frac > 0.65:
+        bx_score += 2.0
     if sym_diff > 0.085:
         bx_score += 3.0
     if lower_mean < 0.35:
         bx_score += 2.5
-    if inner_grad < 0.065:
+    if inner_grad < 0.075:
         bx_score += 2.5
     if dense_bone_frac > 0.04:
         bx_score += 2.0
+    if dense_bone_frac > 0.08:
+        bx_score += 1.5
     # Penalties
     if lower_mean > 0.45 and diaphragm_step > 0.15:
         bx_score -= 5.0
-    if radial_ratio > 3.0 and inner_grad > 0.075:
+    if radial_ratio > 3.0 and inner_grad > 0.085:
         bx_score -= 5.0
 
     raw_scores = {
@@ -345,8 +382,8 @@ def analyze_modality_organ(pil_img):
         "Bone": max(0.1, bx_score)
     }
 
-    # Softmax temperature scaling
-    temp = 1.5
+    # Softmax temperature scaling calibrated for realistic probabilities
+    temp = 3.5
     exp_vals = {k: np.exp(v / temp) for k, v in raw_scores.items()}
     sum_exp = sum(exp_vals.values())
     probs = {k: float(exp_vals[k] / sum_exp) for k in raw_scores}
@@ -355,11 +392,105 @@ def analyze_modality_organ(pil_img):
     best_conf = probs[best_organ]
     modality = "MRI" if best_organ == "Brain" else "X-Ray"
 
+    sorted_organ_candidates = [
+        {"organ": organ_k, "confidence": round(probs[organ_k], 4)}
+        for organ_k in sorted(probs, key=probs.get, reverse=True)
+    ]
+
     CONFIDENCE_THRESHOLD = 0.65
     if best_conf < CONFIDENCE_THRESHOLD:
-        return None, best_conf, None, "Unable to confidently determine whether this is a Brain MRI, Chest X-Ray, or Bone X-Ray. Please upload a supported medical scan."
+        return None, round(best_conf, 4), None, sorted_organ_candidates, "Unable to confidently determine whether the image is a supported Brain MRI, Chest X-Ray, or Bone X-Ray."
 
-    return best_organ, round(best_conf, 4), modality, None
+    return best_organ, round(best_conf, 4), modality, sorted_organ_candidates, None
+
+def compute_gradcam_overlay(pil_img, preprocessed_batch, target_class_index, target_class_name):
+    """
+    Computes real mathematical Grad-CAM using tf.GradientTape, the DenseNet121 internal
+    convolutional layer 'conv5_block16_2_conv', and the selected class score.
+    Returns:
+        overlay_data_uri (str): "data:image/png;base64,..."
+        target_name (str): The disease name targeted
+        layer_name (str): "conv5_block16_2_conv"
+        error (str or None): Error message if failed
+    """
+    global MODEL, GRAD_CAM_MODEL
+    if MODEL is None:
+        return None, target_class_name, TARGET_LAYER_NAME, "Model is not loaded"
+
+    try:
+        # Fallback to initialize if not yet created
+        if GRAD_CAM_MODEL is None:
+            dense_sub = MODEL.get_layer('densenet121')
+            target_conv = dense_sub.get_layer(TARGET_LAYER_NAME)
+            GRAD_CAM_MODEL = keras.models.Model(
+                inputs=dense_sub.input,
+                outputs=[target_conv.output, dense_sub.output]
+            )
+
+        gap = MODEL.get_layer('global_average_pooling2d')
+        dropout = MODEL.get_layer('dropout')
+        classifier = MODEL.get_layer('disease_outputs')
+
+        with tf.GradientTape() as tape:
+            # 1. Forward pass through feature extraction sub-model
+            conv_outputs, dense_features = GRAD_CAM_MODEL(preprocessed_batch)
+            tape.watch(conv_outputs)
+
+            # 2. Forward pass through classification head
+            pooled = gap(dense_features)
+            dropped = dropout(pooled, training=False)
+            predictions = classifier(dropped)
+            target_score = predictions[:, target_class_index]
+
+        # 3. Compute gradients of target class score with respect to convolutional feature maps
+        gradients = tape.gradient(target_score, conv_outputs)
+        if gradients is None:
+            return None, target_class_name, TARGET_LAYER_NAME, "Gradient calculation returned None"
+
+        # 4. Global average pooling of gradients: α_k^c = (1/Z) ∑_i ∑_j (∂y^c / ∂A_{i,j}^k)
+        pooled_gradients = tf.reduce_mean(gradients, axis=(0, 1, 2))
+
+        # 5. Weighted combination of feature maps: L_{Grad-CAM}^c = ReLU( ∑_k α_k^c A^k )
+        cam = tf.reduce_sum(tf.multiply(pooled_gradients, conv_outputs[0]), axis=-1)
+        cam = np.maximum(cam.numpy(), 0)  # ReLU
+
+        # 6. Normalize heatmap between 0 and 1
+        cam_max = float(cam.max())
+        cam_min = float(cam.min())
+        if cam_max > cam_min:
+            normalized_cam = (cam - cam_min) / (cam_max - cam_min)
+        else:
+            normalized_cam = np.zeros_like(cam)
+
+        # 7. Resize heatmap to original image dimensions with bicubic interpolation
+        orig_w, orig_h = pil_img.size
+        heatmap_pil = Image.fromarray((normalized_cam * 255.0).astype(np.uint8))
+        heatmap_resized = heatmap_pil.resize((orig_w, orig_h), Image.Resampling.BICUBIC)
+        heatmap_arr = np.array(heatmap_resized, dtype=np.float32) / 255.0
+
+        # 8. Apply Jet colormap
+        try:
+            cmap = cm.colormaps['jet']
+        except Exception:
+            cmap = cm.get_cmap('jet')
+
+        colored_cam = (cmap(heatmap_arr)[:, :, :3] * 255.0).astype(np.uint8)
+        colored_pil = Image.fromarray(colored_cam)
+
+        # 9. Blend heatmap with original image (alpha = 0.45)
+        orig_rgb = pil_img.convert('RGB')
+        overlay_pil = Image.blend(orig_rgb, colored_pil, alpha=0.45)
+
+        # 10. Encode as Base64 data URI
+        buf = io.BytesIO()
+        overlay_pil.save(buf, format='PNG')
+        b64_str = base64.b64encode(buf.getvalue()).decode('utf-8')
+        data_uri = f"data:image/png;base64,{b64_str}"
+
+        return data_uri, target_class_name, TARGET_LAYER_NAME, None
+
+    except Exception as e:
+        return None, target_class_name, TARGET_LAYER_NAME, str(e)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -378,6 +509,8 @@ def health_check():
         "output_shape": list(MODEL.output_shape) if MODEL else None,
         "labels_count": len(LABELS_DATA),
         "supported_organs": ["Brain", "Chest", "Bone"],
+        "grad_cam_ready": GRAD_CAM_MODEL is not None,
+        "grad_cam_layer": TARGET_LAYER_NAME,
         "endpoints": {
             "health": "/api/health",
             "analyze": "/api/analyze"
@@ -439,21 +572,34 @@ def analyze():
                 "error": "The uploaded image file is empty or corrupted."
             }), 400
 
+        if len(image_bytes) > MAX_FILE_SIZE:
+            return jsonify({
+                "success": False,
+                "error": "Uploaded file exceeds maximum allowed size of 25MB."
+            }), 400
+
         pil_img = Image.open(io.BytesIO(image_bytes))
-    except Exception as e:
+        pil_img.verify()
+        pil_img = Image.open(io.BytesIO(image_bytes))
+    except Exception:
         return jsonify({
             "success": False,
-            "error": f"Image parsing failed: {str(e)}"
+            "error": "Image parsing failed. Please upload a valid, readable medical image file."
         }), 400
 
     # STAGE 1: Pure Modality & Organ Detection (Zero Disease Model Dependencies)
     if organ_mode == 'auto':
-        detected_organ, organ_confidence, detected_modality, routing_err = analyze_modality_organ(pil_img)
+        detected_organ, organ_confidence, detected_modality, top_organ_candidates, routing_err = analyze_modality_organ(pil_img)
         if routing_err or not detected_organ:
             # When reliable organ cannot be determined, do NOT generate disease predictions
             return jsonify({
                 "success": False,
-                "error": routing_err or "Unable to confidently determine whether this is a Brain MRI, Chest X-Ray, or Bone X-Ray. Please upload a supported medical scan."
+                "supported": False,
+                "organ": None,
+                "organ_confidence": organ_confidence,
+                "rejection_reason": routing_err or "Unable to confidently determine whether the image is a supported Brain MRI, Chest X-Ray, or Bone X-Ray.",
+                "error": routing_err or "Unable to confidently determine whether the image is a supported Brain MRI, Chest X-Ray, or Bone X-Ray.",
+                "top_organ_candidates": top_organ_candidates
             }), 400
 
         target_organ = detected_organ
@@ -462,7 +608,7 @@ def analyze():
     else:
         # Manual override fallback if requested by specific API consumers
         target_organ = organ_mode.capitalize()
-        det_organ, det_conf, det_mod, _ = analyze_modality_organ(pil_img)
+        det_organ, det_conf, det_mod, top_organ_candidates, _ = analyze_modality_organ(pil_img)
         organ_confidence = det_conf if det_conf else 0.95
         modality = det_mod if det_mod else ("MRI" if target_organ == "Brain" else "X-Ray")
         analysis_mode = target_organ
@@ -479,9 +625,10 @@ def analyze():
         preprocessed_batch = tf.keras.applications.densenet.preprocess_input(img_batch)
         raw_predictions = MODEL.predict(preprocessed_batch, verbose=0)[0]
     except Exception as e:
+        print(f"[INFERENCE ERROR] {e}")
         return jsonify({
             "success": False,
-            "error": f"Model inference execution failed: {str(e)}"
+            "error": "Model inference execution failed. Please verify the uploaded image format."
         }), 500
 
     # Map all 60 raw probabilities and optimal thresholds
@@ -501,10 +648,19 @@ def analyze():
         allowed_labels = CHEST_LABELS
 
     filtered_abnormalities = []
+    organ_candidates = []
     for label_name in allowed_labels:
         prob = all_probabilities.get(label_name, 0.0)
         threshold = all_thresholds.get(label_name, 0.5)
-        if prob >= threshold:
+        is_detected = bool(prob >= threshold)
+        item = {
+            "name": label_name,
+            "confidence": round(prob, 4),
+            "threshold": round(threshold, 4),
+            "detected": is_detected
+        }
+        organ_candidates.append(item)
+        if is_detected:
             filtered_abnormalities.append({
                 "name": label_name,
                 "confidence": round(prob, 4),
@@ -516,20 +672,59 @@ def analyze():
     # Sort filtered abnormalities by confidence descending
     filtered_abnormalities.sort(key=lambda x: x['confidence'], reverse=True)
 
+    # Sort all organ-specific candidates by confidence descending
+    organ_candidates.sort(key=lambda x: x['confidence'], reverse=True)
+    top_predictions = organ_candidates[:3]
+
+    # 9. Real Mathematical Grad-CAM Generation using DenseNet121 Target Layer
+    # Requirement: If a pathology is detected above threshold:
+    # -> Generate Grad-CAM for the highest-confidence detected pathology.
+    # If ZERO pathologies cross threshold:
+    # -> Generate Grad-CAM for the highest-probability organ-specific candidate.
+    if filtered_abnormalities:
+        gradcam_target_name = filtered_abnormalities[0]['name']
+    else:
+        gradcam_target_name = organ_candidates[0]['name']
+
+    # Resolve target class index in 60-output model
+    target_class_index = None
+    for idx, (lbl_name, _) in enumerate(LABELS_DATA):
+        if lbl_name == gradcam_target_name:
+            target_class_index = idx
+            break
+
+    gradcam_data_uri = None
+    cam_target = gradcam_target_name
+    cam_layer = TARGET_LAYER_NAME
+    cam_err = None
+
+    if target_class_index is not None:
+        gradcam_data_uri, cam_target, cam_layer, cam_err = compute_gradcam_overlay(
+            pil_img, preprocessed_batch, target_class_index, gradcam_target_name
+        )
+    else:
+        cam_err = "Target class index not found in model outputs"
+
     elapsed_time = round(time.time() - start_time, 3)
 
-    # 9. Return JSON response strictly formatted as required
+    # 10. Return JSON response strictly formatted as required
     response_payload = {
         "success": True,
+        "supported": True,
         "organ": target_organ,
         "organ_confidence": round(float(organ_confidence), 4),
         "analysis_mode": analysis_mode,
         "modality": modality,
+        "top_organ_candidates": top_organ_candidates,
         "abnormalities": filtered_abnormalities,
         "detected_count": len(filtered_abnormalities),
+        "top_predictions": top_predictions,
         "all_probabilities": all_probabilities,
         "all_thresholds": all_thresholds,
-        "grad_cam_image": None,
+        "grad_cam_image": gradcam_data_uri,
+        "grad_cam_target": cam_target,
+        "grad_cam_layer": cam_layer,
+        "grad_cam_error": cam_err,
         "xai_method": "Grad-CAM",
         "model_name": "DenseNet121-MultiLabel-60",
         "processing_time": elapsed_time
@@ -538,10 +733,12 @@ def analyze():
     return jsonify(response_payload), 200
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    host = os.environ.get('HOST', '0.0.0.0')
     print("=========================================================")
     print("MEDIC-XAI Real DenseNet121 Machine Learning Backend")
-    print("Listening on http://127.0.0.1:5000")
-    print("API Endpoint: POST http://127.0.0.1:5000/api/analyze")
+    print(f"Listening on http://{host}:{port}")
+    print(f"API Endpoint: POST http://{host}:{port}/api/analyze")
     print("=========================================================")
     # Run with debug=False to avoid duplicate model reload
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host=host, port=port, debug=False)

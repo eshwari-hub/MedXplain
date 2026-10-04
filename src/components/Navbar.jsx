@@ -70,13 +70,13 @@ export function Navbar({ activeSection, onNavigate, onOpenBackendModal, isLiveMo
             <div 
               className="live-model-badge" 
               onClick={onOpenBackendModal}
-              title="Real DenseNet121 model connected via Flask backend (http://127.0.0.1:5000). Click to view status."
+              title="Real DenseNet121 model connected via AI backend. Click to view status."
               role="button"
               tabIndex={0}
             >
               <span className="live-dot" />
               <span className="live-model-text">LIVE MODEL</span>
-              <span className="live-subtext">Flask: 5000</span>
+              <span className="live-subtext">AI Connected</span>
             </div>
           ) : (
             <div 
@@ -110,7 +110,7 @@ export function Navbar({ activeSection, onNavigate, onOpenBackendModal, isLiveMo
               <div className="live-model-badge w-full justify-center">
                 <span className="live-dot" />
                 <span className="live-model-text">LIVE MODEL ACTIVE</span>
-                <span className="live-subtext">• Port 5000</span>
+                <span className="live-subtext">• AI Backend Connected</span>
               </div>
             ) : (
               <button 

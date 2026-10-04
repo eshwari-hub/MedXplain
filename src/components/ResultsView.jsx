@@ -113,6 +113,21 @@ export function ResultsView({ analysisResult, onGoToGradcam, onOpenReportModal }
                   style={{ width: `${typeof analysisResult.organConfidence === 'number' ? Math.min(100, analysisResult.organConfidence) : 95}%` }}
                 />
               </div>
+
+              {/* Organ Router Probability Distribution */}
+              {(analysisResult.top_organ_candidates || analysisResult.topOrganCandidates) && (
+                <div className="mt-2.5 pt-2 border-t border-glass flex items-center justify-end gap-2 text-[11px] mono text-muted flex-wrap">
+                  {(analysisResult.top_organ_candidates || analysisResult.topOrganCandidates).map((c, i) => {
+                    const isWinner = c.organ?.toLowerCase() === organId;
+                    const cProb = typeof c.confidence === 'number' ? (c.confidence <= 1.0 ? (c.confidence * 100).toFixed(1) : c.confidence) : c.confidence;
+                    return (
+                      <span key={i} className={`organ-cand-pill ${isWinner ? 'text-cyan font-bold' : 'text-muted'}`}>
+                        {c.organ}: {cProb}%
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -188,26 +203,35 @@ export function ResultsView({ analysisResult, onGoToGradcam, onOpenReportModal }
               <div className="card-header-styled">
                 <div>
                   <h3 className="card-title">
-                    Detected Pathologies & Confidence
+                    Abnormalities
                   </h3>
                   <span className="mono text-xs text-muted">
-                    Model Confidence (Class Probability Score)
+                    Organ-Specific Pathology Inferences
                   </span>
                 </div>
-                <span className="badge badge-cyan mono text-xs">
-                  {analysisResult.abnormalities?.length || 0} Class Inferences
+                <span className={`badge ${analysisResult.abnormalities?.length > 0 ? 'badge-cyan' : 'badge-normal'} mono text-xs`}>
+                  {analysisResult.abnormalities?.length || 0} Detected
                 </span>
               </div>
 
               <div className="abnormalities-list">
                 {(!analysisResult.abnormalities || analysisResult.abnormalities.length === 0) ? (
-                  <div className="p-4 text-center text-muted text-sm">
-                    No abnormalities identified by the model.
+                  <div className="no-abnormalities-card glass-panel-subtle p-5 text-center my-2 rounded-lg">
+                    <div className="no-abn-icon-circle mx-auto mb-2">
+                      <CheckCircle2 size={32} className="text-normal mx-auto" />
+                    </div>
+                    <h4 className="no-abnormalities-title text-base font-bold text-primary">
+                      No abnormalities identified by the model
+                    </h4>
+                    <p className="no-abnormalities-desc text-xs text-secondary mt-1 max-w-sm mx-auto">
+                      All evaluated {organName} pathology probabilities remain below their respective calibrated diagnostic thresholds.
+                    </p>
                   </div>
                 ) : (
                   analysisResult.abnormalities.map((abn, idx) => {
                     const confVal = typeof abn.confidence === 'number' ? abn.confidence : 0;
-                    const isPositive = confVal >= 50;
+                    const threshVal = typeof abn.threshold === 'number' ? abn.threshold : 50;
+                    const isPositive = confVal >= threshVal;
                     return (
                       <div 
                         key={abn.id || idx} 
@@ -220,7 +244,9 @@ export function ResultsView({ analysisResult, onGoToGradcam, onOpenReportModal }
                           </div>
                           <div className="abn-confidence-num mono">
                             <span className="font-bold text-lg">{confVal.toFixed(1)}%</span>
-                            <span className="text-xs text-muted block text-right font-normal">Confidence</span>
+                            <span className="text-xs text-muted block text-right font-normal">
+                              Threshold: {threshVal.toFixed(1)}%
+                            </span>
                           </div>
                         </div>
 
@@ -230,27 +256,33 @@ export function ResultsView({ analysisResult, onGoToGradcam, onOpenReportModal }
                             className={`abn-meter-fill ${getConfidenceColorClass(confVal)}`}
                             style={{ width: `${Math.min(100, Math.max(2, confVal))}%` }}
                           />
-                          <div className="threshold-marker" style={{ left: '50%' }} title="50% Classification Threshold" />
+                          <div 
+                            className="threshold-marker" 
+                            style={{ left: `${Math.min(99, Math.max(1, threshVal))}%` }} 
+                            title={`Threshold: ${threshVal.toFixed(1)}%`} 
+                          />
                         </div>
 
                         <div className="abn-footer-meta">
                           <div className="abn-region-tag">
                             <span className="text-muted">Anatomical Region: </span>
                             <span className="text-cyan font-mono text-xs">
-                              {abn.region || abn.affectedRegion || 'Not specified'}
+                              {abn.region || abn.affectedRegion || 'Organ specific'}
                             </span>
                           </div>
                           <div className="abn-badge-status">
                             <span className={`badge ${isPositive ? 'badge-urgent' : 'badge-normal'}`}>
-                              {abn.status || (isPositive ? 'Detected' : 'Normal Range')}
+                              {isPositive ? 'Above Threshold' : 'Normal Range'}
                             </span>
                           </div>
                         </div>
 
                         {/* Disease Stage if present on individual item */}
-                        <div className="abn-stage-sub text-xs text-muted mt-1 flex justify-between">
-                          <span>Stage: <strong className="text-primary">{abn.stage || 'Not available'}</strong></span>
-                        </div>
+                        {abn.stage && (
+                          <div className="abn-stage-sub text-xs text-muted mt-1 flex justify-between">
+                            <span>Stage: <strong className="text-primary">{abn.stage}</strong></span>
+                          </div>
+                        )}
 
                         {/* Clinical summary if available */}
                         {abn.clinicalReasoning && (
@@ -263,6 +295,75 @@ export function ResultsView({ analysisResult, onGoToGradcam, onOpenReportModal }
                   })
                 )}
               </div>
+
+              {/* TOP MODEL CANDIDATES SECTION */}
+              {((analysisResult.top_predictions && analysisResult.top_predictions.length > 0) || 
+                (analysisResult.topPredictions && analysisResult.topPredictions.length > 0)) && (
+                <div className="top-candidates-section mt-5 pt-4 border-t border-glass">
+                  <div className="top-candidates-header mb-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <TrendingUp size={16} className="text-cyan" />
+                        <h4 className="top-candidates-title font-mono uppercase text-sm font-bold text-primary">
+                          Top Model Candidates
+                        </h4>
+                      </div>
+                      <span className="badge badge-muted text-xs mono">
+                        Top 3 {organName} Classes
+                      </span>
+                    </div>
+                    <p className="text-xs text-secondary mt-1">
+                      Organ-specific candidate class probabilities and their calibrated diagnostic thresholds:
+                    </p>
+                  </div>
+
+                  <div className="candidates-list flex flex-col gap-2.5">
+                    {(analysisResult.top_predictions || analysisResult.topPredictions || []).slice(0, 3).map((cand, idx) => {
+                      const probVal = typeof cand.confidence === 'number' ? cand.confidence : 0;
+                      const threshVal = typeof cand.threshold === 'number' ? cand.threshold : 50;
+                      const isDetected = Boolean(cand.detected);
+                      return (
+                        <div key={idx} className="candidate-item-card glass-panel-subtle p-3 rounded-lg">
+                          <div className="candidate-info-row flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="candidate-rank font-mono font-bold text-cyan text-sm">
+                                {idx + 1}.
+                              </span>
+                              <span className="candidate-name font-semibold text-primary">
+                                {cand.name}
+                              </span>
+                              <span className="text-muted text-xs">—</span>
+                              <span className="candidate-prob font-mono font-bold text-cyan text-sm">
+                                {probVal.toFixed(1)}%
+                              </span>
+                              <span className="text-muted text-xs">—</span>
+                              <span className="candidate-thresh font-mono text-xs text-muted">
+                                Threshold {threshVal.toFixed(1)}%
+                              </span>
+                            </div>
+                            <span className={`badge ${isDetected ? 'badge-urgent' : 'badge-below-thresh'} text-xs mono`}>
+                              {isDetected ? 'Detected' : 'Below diagnostic threshold'}
+                            </span>
+                          </div>
+
+                          {/* Visual Meter Bar */}
+                          <div className="candidate-meter-track mt-2">
+                            <div 
+                              className={`candidate-meter-fill ${isDetected ? 'high-conf' : 'sub-thresh'}`}
+                              style={{ width: `${Math.min(100, Math.max(2, probVal))}%` }}
+                            />
+                            <div 
+                              className="candidate-threshold-marker"
+                              style={{ left: `${Math.min(99, Math.max(1, threshVal))}%` }}
+                              title={`Threshold: ${threshVal.toFixed(1)}%`}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 

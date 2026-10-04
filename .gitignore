@@ -51,4 +51,10 @@ test.csv
 *.zip
 scratch_*.py
 verify_*.py
+tests/gradcam_validation/
+
+# Environment & Secrets
+.env
+.env*.local
+!.env.example
 

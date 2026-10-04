@@ -88,7 +88,10 @@ export function ReportModal({ isOpen, onClose, analysisResult }) {
               <tbody>
                 {(!analysisResult.abnormalities || analysisResult.abnormalities.length === 0) ? (
                   <tr>
-                    <td colSpan="4" className="text-muted text-center">No abnormalities detected.</td>
+                    <td colSpan="4" className="text-muted text-center py-4">
+                      <strong>No abnormalities identified by the model</strong>
+                      <div className="text-xs mt-1">All evaluated {organ} probabilities remain below diagnostic thresholds.</div>
+                    </td>
                   </tr>
                 ) : (
                   analysisResult.abnormalities.map((abn, i) => {
@@ -105,6 +108,36 @@ export function ReportModal({ isOpen, onClose, analysisResult }) {
                 )}
               </tbody>
             </table>
+
+            {/* Top Model Candidates in Report if zero abnormalities */}
+            {(!analysisResult.abnormalities || analysisResult.abnormalities.length === 0) && 
+             (analysisResult.top_predictions?.length > 0 || analysisResult.topPredictions?.length > 0) && (
+              <div className="report-candidates-box mt-3 pt-2 border-t">
+                <h5 className="text-xs font-bold uppercase mono text-muted mb-2">Top Model Candidates (Sub-Diagnostic Activations)</h5>
+                <table className="report-table text-xs">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Class Name</th>
+                      <th>Probability</th>
+                      <th>Threshold</th>
+                      <th>Diagnostic Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(analysisResult.top_predictions || analysisResult.topPredictions || []).slice(0, 3).map((c, idx) => (
+                      <tr key={idx}>
+                        <td className="mono">{idx + 1}</td>
+                        <td><strong>{c.name}</strong></td>
+                        <td className="mono">{typeof c.confidence === 'number' ? c.confidence.toFixed(1) : c.confidence}%</td>
+                        <td className="mono">Threshold {typeof c.threshold === 'number' ? c.threshold.toFixed(1) : c.threshold}%</td>
+                        <td><span className="mono text-muted">Below diagnostic threshold</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
 
           {/* Grad-CAM Interpretability Section */}

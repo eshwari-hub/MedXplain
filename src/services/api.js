@@ -2,17 +2,47 @@
 
 import { PRESET_CASES } from '../data/sampleData';
 
-const DEFAULT_BACKEND_URL = 'http://127.0.0.1:5000';
+function resolveInitialBackendUrl() {
+  const envUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) 
+    ? String(import.meta.env.VITE_API_URL).trim().replace(/\/+$/, '') 
+    : '';
+
+  const isBrowser = typeof window !== 'undefined';
+  const isLocalHost = isBrowser && (
+    window.location.hostname === 'localhost' || 
+    window.location.hostname === '127.0.0.1' || 
+    window.location.hostname === '0.0.0.0'
+  );
+
+  let stored = null;
+  try {
+    stored = localStorage.getItem('medic_xai_backend_url');
+  } catch {
+    // localStorage might be restricted in some privacy modes
+  }
+
+  // If in cloud production and stored URL points to localhost, ignore and clear stale local URL
+  if (stored && !isLocalHost && (stored.includes('127.0.0.1') || stored.includes('localhost'))) {
+    try { localStorage.removeItem('medic_xai_backend_url'); } catch {}
+    stored = null;
+  }
+
+  if (stored) return stored.replace(/\/+$/, '');
+  if (envUrl) return envUrl;
+  return isLocalHost ? 'http://127.0.0.1:5000' : '';
+}
 
 class MedicalAIService {
   constructor() {
-    this.backendUrl = localStorage.getItem('medic_xai_backend_url') || DEFAULT_BACKEND_URL;
+    this.backendUrl = resolveInitialBackendUrl();
     this.isLiveConnected = false;
   }
 
   setBackendUrl(url) {
-    this.backendUrl = url.replace(/\/+$/, ''); // Strip trailing slash
-    localStorage.setItem('medic_xai_backend_url', this.backendUrl);
+    this.backendUrl = (url || '').trim().replace(/\/+$/, '');
+    try {
+      localStorage.setItem('medic_xai_backend_url', this.backendUrl);
+    } catch {}
   }
 
   getBackendUrl() {
@@ -23,6 +53,10 @@ class MedicalAIService {
    * Health check to detect if the Flask server is running at /api/health
    */
   async checkHealth() {
+    if (!this.backendUrl) {
+      this.isLiveConnected = false;
+      return { connected: false, status: 'offline' };
+    }
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 2000);
@@ -45,15 +79,11 @@ class MedicalAIService {
    * Sends:
    *   - file: Image file (multipart/form-data)
    *   - organ_mode: 'auto' | 'brain' | 'chest' | 'bone'
-   *
-   * Handles:
-   *   - Backend unavailable
-   *   - Invalid/unsupported image
-   *   - API timeout (25s)
-   *   - Model error
-   *   - Empty prediction response
    */
   async analyzeLive(file, organMode = 'auto', onProgress = () => {}) {
+    if (!this.backendUrl) {
+      throw new Error("AI analysis service URL is not configured. Please ensure VITE_API_URL is set in your deployment environment or configure the server endpoint in settings.");
+    }
     if (!file) {
       throw new Error("Invalid image file. Please provide a valid medical image file (DICOM, PNG, JPG, or TIFF).");
     }
@@ -70,14 +100,14 @@ class MedicalAIService {
       }
     }
 
-    onProgress(1, "Connecting to Flask API (http://localhost:5000)...", 20);
+    onProgress(1, "Connecting to AI Analysis Backend...", 20);
 
     const formData = new FormData();
     formData.append('file', actualFile);
     formData.append('organ_mode', organMode || 'auto');
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s timeout
+    const timeoutId = setTimeout(() => controller.abort(), 35000); // 35s timeout for deep learning computation
 
     onProgress(2, "Detecting Organ (Brain MRI / Chest X-Ray / Bone X-Ray)...", 40);
 
@@ -92,20 +122,20 @@ class MedicalAIService {
     } catch (networkErr) {
       clearTimeout(timeoutId);
       if (networkErr.name === 'AbortError') {
-        throw new Error("Analysis request timed out. The model server may be under heavy load or processing a large tensor. Please try again.");
+        throw new Error("AI analysis service request timed out. Please try again.");
       }
-      throw new Error("Unable to connect to the analysis server. Please make sure the Flask backend is running on http://localhost:5000.");
+      throw new Error("AI analysis service is currently unavailable. Please try again later.");
     }
 
     if (!response.ok) {
-      let errorMsg = `Server returned HTTP ${response.status}`;
+      let errorMsg = "AI analysis service is currently unavailable. Please try again later.";
       try {
         const errJson = await response.json();
         if (errJson && errJson.error) {
           errorMsg = errJson.error;
         }
       } catch {
-        // Fallback to text if not json
+        // Fallback to clean error message
       }
       throw new Error(errorMsg);
     }
@@ -114,15 +144,15 @@ class MedicalAIService {
     try {
       result = await response.json();
     } catch {
-      throw new Error("Received an empty prediction response from the analysis server.");
+      throw new Error("Received an invalid response from the analysis server.");
     }
 
     if (!result || typeof result !== 'object') {
-      throw new Error("Received an empty prediction response from the analysis server.");
+      throw new Error("Received an invalid response from the analysis server.");
     }
 
     if (result.success === false) {
-      throw new Error(result.error || 'Analysis failed on backend');
+      throw new Error(result.error || 'AI analysis service is currently unavailable. Please try again later.');
     }
 
     onProgress(3, `Organ Detected: ${result.organ} — Routing to pipeline...`, 70);
@@ -134,17 +164,35 @@ class MedicalAIService {
       let rawConf = abn.confidence;
       let displayConf = 0;
       if (typeof rawConf === 'number') {
-        // If 0 <= rawConf <= 1.0, scale to 0..100
         displayConf = rawConf <= 1.0 ? rawConf * 100 : rawConf;
       }
+      let rawThresh = abn.threshold;
+      let displayThresh = typeof rawThresh === 'number' ? (rawThresh <= 1.0 ? rawThresh * 100 : rawThresh) : 50;
       return {
         name: abn.name || 'Unspecified Abnormality',
         confidence: displayConf,
         rawConfidence: rawConf,
-        threshold: abn.threshold,
-        stage: abn.stage || null, // Optional; if null, UI displays 'Not available'
+        threshold: displayThresh,
+        rawThreshold: rawThresh,
+        stage: abn.stage || null,
         region: abn.region || null,
         clinicalReasoning: abn.clinical_reasoning || abn.reasoning || null
+      };
+    });
+
+    // Normalize Top Model Candidates (top 3 organ-specific predictions)
+    const normalizedTopPredictions = (result.top_predictions || []).map(p => {
+      let rawConf = p.confidence;
+      let displayConf = typeof rawConf === 'number' ? (rawConf <= 1.0 ? rawConf * 100 : rawConf) : 0;
+      let rawThresh = p.threshold;
+      let displayThresh = typeof rawThresh === 'number' ? (rawThresh <= 1.0 ? rawThresh * 100 : rawThresh) : 50;
+      return {
+        name: p.name || 'Candidate',
+        confidence: displayConf,
+        rawConfidence: rawConf,
+        threshold: displayThresh,
+        rawThreshold: rawThresh,
+        detected: Boolean(p.detected)
       };
     });
 
@@ -163,14 +211,22 @@ class MedicalAIService {
       organName: result.organ || 'Unspecified',
       organConfidence: organConf,
       rawOrganConfidence: result.organ_confidence || 0.95,
+      supported: result.supported !== false,
+      top_organ_candidates: result.top_organ_candidates || [],
+      topOrganCandidates: result.top_organ_candidates || [],
       analysisMode: result.analysis_mode || 'Auto',
       modality: result.modality || 'Medical Imaging',
       abnormalities: normalizedAbnormalities,
+      top_predictions: normalizedTopPredictions,
+      topPredictions: normalizedTopPredictions,
       grad_cam_image: result.grad_cam_image || null,
+      grad_cam_target: result.grad_cam_target || (normalizedTopPredictions[0]?.name || null),
+      grad_cam_layer: result.grad_cam_layer || 'conv5_block16_2_conv',
+      grad_cam_error: result.grad_cam_error || null,
       xai_method: result.xai_method || 'Grad-CAM',
       processing_time: result.processing_time || 0.0,
-      triageLevel: normalizedAbnormalities.some(a => a.confidence >= 50) ? 'Action Required' : 'Normal / Clear',
-      overallStatus: normalizedAbnormalities.length > 0 ? 'Model Evaluation Complete' : 'No Abnormalities Detected'
+      triageLevel: normalizedAbnormalities.length > 0 ? (normalizedAbnormalities.some(a => a.confidence >= 50) ? 'Action Required' : 'Model Complete') : 'Normal / Clear',
+      overallStatus: normalizedAbnormalities.length > 0 ? 'Model Evaluation Complete' : 'No abnormalities identified by the model'
     };
   }
 
@@ -224,7 +280,15 @@ class MedicalAIService {
       rawOrganConfidence: 0.948,
       analysisMode: 'Auto',
       modality: baseCase.modality,
+      top_predictions: baseCase.top_predictions || [
+        { name: 'Effusion', confidence: 42.3, threshold: 65.0, detected: false },
+        { name: 'Atelectasis', confidence: 31.8, threshold: 60.0, detected: false },
+        { name: 'Pneumonia', confidence: 18.4, threshold: 55.0, detected: false }
+      ],
+      topPredictions: baseCase.top_predictions || [],
       grad_cam_image: null, // In demo, uses canvas rendering with explicit demo notice
+      grad_cam_target: baseCase.grad_cam_target || baseCase.abnormalities?.[0]?.name || 'Target Pathology',
+      grad_cam_layer: 'conv5_block16_2_conv',
       xai_method: 'Grad-CAM (Demo Projection)',
       processing_time: 1.84,
       overallStatus: 'DEMO MODE — Simulated Results'
