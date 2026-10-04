@@ -131,8 +131,12 @@ def ensure_model_loaded():
             if MODEL is None:
                 init_model()
 
+GAP_LAYER = None
+DROPOUT_LAYER = None
+CLASSIFIER_LAYER = None
+
 def init_model():
-    global MODEL, MODEL_PATH_LOADED, LABELS_DATA, LABELS_DICT, GRAD_CAM_MODEL
+    global MODEL, MODEL_PATH_LOADED, LABELS_DATA, LABELS_DICT, GRAD_CAM_MODEL, GAP_LAYER, DROPOUT_LAYER, CLASSIFIER_LAYER
     model_file = resolve_file(MODEL_CANDIDATES)
     thresh_file = resolve_file(THRESHOLDS_CANDIDATES)
 
@@ -165,6 +169,9 @@ def init_model():
                 inputs=dense_sub.input,
                 outputs=[target_conv.output, dense_sub.output]
             )
+            GAP_LAYER = MODEL.get_layer('global_average_pooling2d')
+            DROPOUT_LAYER = MODEL.get_layer('dropout')
+            CLASSIFIER_LAYER = MODEL.get_layer('disease_outputs')
             print(f"[INIT] Grad-CAM model created targeting layer '{TARGET_LAYER_NAME}' (output shape: {target_conv.output.shape})!", flush=True)
         except Exception as e_cam:
             print(f"[WARNING] Could not initialize Grad-CAM sub-model: {e_cam}", flush=True)
@@ -449,9 +456,9 @@ def compute_gradcam_overlay(pil_img, preprocessed_batch, target_class_index, tar
                 outputs=[target_conv.output, dense_sub.output]
             )
 
-        gap = MODEL.get_layer('global_average_pooling2d')
-        dropout = MODEL.get_layer('dropout')
-        classifier = MODEL.get_layer('disease_outputs')
+        gap = GAP_LAYER if GAP_LAYER is not None else MODEL.get_layer('global_average_pooling2d')
+        dropout = DROPOUT_LAYER if DROPOUT_LAYER is not None else MODEL.get_layer('dropout')
+        classifier = CLASSIFIER_LAYER if CLASSIFIER_LAYER is not None else MODEL.get_layer('disease_outputs')
 
         with tf.GradientTape() as tape:
             # 1. Forward pass through feature extraction sub-model
@@ -484,9 +491,9 @@ def compute_gradcam_overlay(pil_img, preprocessed_batch, target_class_index, tar
         else:
             normalized_cam = np.zeros_like(cam)
 
-        # 7. Resize heatmap to image dimensions with bicubic interpolation (capped at 1024 to prevent memory exhaustion)
+        # 7. Resize heatmap to image dimensions with bicubic interpolation (capped at 768 for fast encoding)
         orig_w, orig_h = pil_img.size
-        max_dim = 1024
+        max_dim = 768
         if max(orig_w, orig_h) > max_dim:
             scale = max_dim / float(max(orig_w, orig_h))
             target_w = max(1, int(orig_w * scale))
@@ -601,6 +608,8 @@ def analyze():
         }), 503
 
     # 4. Ingest and parse uploaded medical image
+    t_load_start = time.time()
+    print(f"[TIMING] image loading started at {t_load_start:.3f}", flush=True)
     try:
         image_bytes = uploaded_file.read()
         print(f"[ANALYZE] image received - filename='{uploaded_file.filename}', size={len(image_bytes)} bytes", flush=True)
@@ -619,7 +628,8 @@ def analyze():
         pil_img = Image.open(io.BytesIO(image_bytes))
         pil_img.verify()
         pil_img = Image.open(io.BytesIO(image_bytes))
-        print(f"[ANALYZE] image validation passed - format={pil_img.format}, size={pil_img.size}, mode={pil_img.mode}", flush=True)
+        t_load_end = time.time()
+        print(f"[TIMING] image loading & validation passed in {t_load_end - t_load_start:.3f}s - format={pil_img.format}, size={pil_img.size}, mode={pil_img.mode}", flush=True)
     except Exception:
         return jsonify({
             "success": False,
@@ -627,6 +637,8 @@ def analyze():
         }), 400
 
     # STAGE 1: Pure Modality & Organ Detection (Zero Disease Model Dependencies)
+    t_organ_start = time.time()
+    print(f"[TIMING] modality/organ detection started at {t_organ_start:.3f}", flush=True)
     if organ_mode == 'auto':
         detected_organ, organ_confidence, detected_modality, top_organ_candidates, routing_err = analyze_modality_organ(pil_img)
         if routing_err or not detected_organ:
@@ -652,18 +664,25 @@ def analyze():
         modality = det_mod if det_mod else ("MRI" if target_organ == "Brain" else "X-Ray")
         analysis_mode = target_organ
 
-    # Log detected organ details for auditability
-    print(f"[ORGAN DETECTION] Detected organ: {target_organ}, Confidence: {organ_confidence}, Modality: {modality}", flush=True)
+    t_organ_end = time.time()
+    print(f"[TIMING] modality/organ detection completed in {t_organ_end - t_organ_start:.3f}s - detected: {target_organ}, confidence: {organ_confidence}", flush=True)
 
-    # STAGE 2: Run inference with real unified DenseNet121 model (60 sigmoid outputs)
+    # STAGE 2: Preprocessing and Model Inference
+    t_prep_start = time.time()
+    print(f"[TIMING] preprocessing started at {t_prep_start:.3f}", flush=True)
     try:
-        print("[ANALYZE] model inference started (DenseNet121 unified 60-class)", flush=True)
-        # Preprocessing: convert to RGB -> resize to 224x224 -> densenet.preprocess_input
         resized_img = pil_img.convert('RGB').resize((224, 224), Image.Resampling.BILINEAR)
         img_array = np.array(resized_img, dtype=np.float32)
         img_batch = np.expand_dims(img_array, axis=0)
         preprocessed_batch = tf.keras.applications.densenet.preprocess_input(img_batch)
+        t_prep_end = time.time()
+        print(f"[TIMING] preprocessing completed in {t_prep_end - t_prep_start:.3f}s", flush=True)
+
+        t_infer_start = time.time()
+        print(f"[TIMING] MODEL(batch, training=False) started at {t_infer_start:.3f}", flush=True)
         raw_predictions = MODEL(preprocessed_batch, training=False).numpy()[0]
+        t_infer_end = time.time()
+        print(f"[TIMING] MODEL(batch, training=False) completed in {t_infer_end - t_infer_start:.3f}s", flush=True)
     except Exception as e:
         print(f"[INFERENCE ERROR] {e}", flush=True)
         return jsonify({
@@ -716,42 +735,27 @@ def analyze():
     organ_candidates.sort(key=lambda x: x['confidence'], reverse=True)
     top_predictions = organ_candidates[:3]
 
-    # 9. Real Mathematical Grad-CAM Generation using DenseNet121 Target Layer
-    # Requirement: If a pathology is detected above threshold:
-    # -> Generate Grad-CAM for the highest-confidence detected pathology.
-    # If ZERO pathologies cross threshold:
-    # -> Generate Grad-CAM for the highest-probability organ-specific candidate.
+    # Grad-CAM Target Selection
     if filtered_abnormalities:
         gradcam_target_name = filtered_abnormalities[0]['name']
     else:
         gradcam_target_name = organ_candidates[0]['name']
 
-    # Resolve target class index in 60-output model
-    target_class_index = None
-    for idx, (lbl_name, _) in enumerate(LABELS_DATA):
-        if lbl_name == gradcam_target_name:
-            target_class_index = idx
-            break
-
+    # DIAGNOSTIC ISOLATION: Temporarily disable compute_gradcam_overlay()
+    print("[DIAGNOSTIC] Grad-CAM temporarily disabled for production isolation test", flush=True)
     gradcam_data_uri = None
     cam_target = gradcam_target_name
     cam_layer = TARGET_LAYER_NAME
     cam_err = None
 
-    if target_class_index is not None:
-        print(f"[ANALYZE] Grad-CAM started - layer='{cam_layer}', target='{cam_target}'", flush=True)
-        gradcam_data_uri, cam_target, cam_layer, cam_err = compute_gradcam_overlay(
-            pil_img, preprocessed_batch, target_class_index, gradcam_target_name
-        )
-    else:
-        cam_err = "Target class index not found in model outputs"
-
+    t_resp_start = time.time()
+    print(f"[TIMING] response creation started at {t_resp_start:.3f}", flush=True)
     elapsed_time = round(time.time() - start_time, 3)
     top_pred_name = top_predictions[0]['name'] if top_predictions else 'None'
     print(f"[ANALYZE] response generated - organ='{target_organ}', confidence={organ_confidence}, detected_abnormalities={len(filtered_abnormalities)}, top_prediction='{top_pred_name}'", flush=True)
     print(f"[ANALYZE] total processing time: {elapsed_time}s", flush=True)
 
-    # 10. Return JSON response strictly formatted as required
+    # Return JSON response strictly formatted as required
     response_payload = {
         "success": True,
         "supported": True,
@@ -765,14 +769,17 @@ def analyze():
         "top_predictions": top_predictions,
         "all_probabilities": all_probabilities,
         "all_thresholds": all_thresholds,
-        "grad_cam_image": gradcam_data_uri,
+        "grad_cam_image": None,
+        "gradcam_status": "disabled_for_production_test",
         "grad_cam_target": cam_target,
         "grad_cam_layer": cam_layer,
-        "grad_cam_error": cam_err,
-        "xai_method": "Grad-CAM",
+        "grad_cam_error": None,
+        "xai_method": "Grad-CAM (Disabled for Diagnostic Test)",
         "model_name": "DenseNet121-MultiLabel-60",
         "processing_time": elapsed_time
     }
+    t_resp_end = time.time()
+    print(f"[TIMING] response creation completed in {t_resp_end - t_resp_start:.3f}s", flush=True)
 
     return jsonify(response_payload), 200
 
