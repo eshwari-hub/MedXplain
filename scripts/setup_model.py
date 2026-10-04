@@ -1,5 +1,5 @@
 """
-Model Verification & Download Script for MEDIC-XAI
+Model Verification & Download Script for MEDIC-XAI (Render & Cloud Deployment)
 Ensures best_densenet121.keras is present and valid before server startup.
 """
 
@@ -11,47 +11,88 @@ MODEL_DIR = os.path.join(BASE_DIR, "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "best_densenet121.keras")
 THRESHOLDS_PATH = os.path.join(MODEL_DIR, "optimal_thresholds.csv")
 
-def check_model():
-    print("=" * 60)
-    print("MEDIC-XAI: Production Model Verification")
-    print("=" * 60)
+EXPECTED_MIN_SIZE_BYTES = 25 * 1024 * 1024  # At least 25 MB
 
-    if not os.path.exists(MODEL_DIR):
-        os.makedirs(MODEL_DIR, exist_ok=True)
+def check_and_provision_model():
+    print("=" * 70)
+    print("MEDIC-XAI: Production Model Verification & Provisioning")
+    print("=" * 70)
 
-    model_present = os.path.exists(MODEL_PATH)
-    thresh_present = os.path.exists(THRESHOLDS_PATH)
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
-    if model_present:
-        size_mb = os.path.getsize(MODEL_PATH) / (1024 * 1024)
-        print(f"[OK] Model found: {MODEL_PATH} ({size_mb:.2f} MB)")
-    else:
-        print(f"[ERROR] Model file missing: {MODEL_PATH}")
-        print("To deploy the model:")
-        print("1. Upload best_densenet121.keras to medical/models/")
-        print("   OR set MODEL_PATH environment variable to its location.")
-        print("   OR host it on a direct download URL and set MODEL_DOWNLOAD_URL.")
+    # 1. Verify optimal thresholds
+    if not os.path.exists(THRESHOLDS_PATH):
+        print(f"[FATAL] Thresholds file missing: {THRESHOLDS_PATH}")
+        return False
+    print(f"[OK] Thresholds file present: {THRESHOLDS_PATH}")
 
-    if thresh_present:
-        print(f"[OK] Thresholds file found: {THRESHOLDS_PATH}")
-    else:
-        print(f"[ERROR] Thresholds file missing: {THRESHOLDS_PATH}")
+    # 2. Check if model already exists and is valid
+    if os.path.exists(MODEL_PATH):
+        size_bytes = os.path.getsize(MODEL_PATH)
+        if size_bytes >= EXPECTED_MIN_SIZE_BYTES:
+            size_mb = size_bytes / (1024 * 1024)
+            print(f"[OK] Model already present and verified: {MODEL_PATH} ({size_mb:.2f} MB)")
+            return True
+        else:
+            print(f"[WARNING] Existing model file is incomplete ({size_bytes} bytes). Re-downloading...")
+            try:
+                os.remove(MODEL_PATH)
+            except Exception:
+                pass
 
-    # Check MODEL_DOWNLOAD_URL if model is missing
+    # 3. Model is missing or incomplete: check MODEL_DOWNLOAD_URL
     download_url = os.environ.get("MODEL_DOWNLOAD_URL")
-    if not model_present and download_url:
-        print(f"[DOWNLOAD] Fetching model from: {download_url} ...")
-        try:
-            import urllib.request
-            urllib.request.urlretrieve(download_url, MODEL_PATH)
-            size_mb = os.path.getsize(MODEL_PATH) / (1024 * 1024)
-            print(f"[OK] Downloaded model successfully ({size_mb:.2f} MB)")
-            model_present = True
-        except Exception as e:
-            print(f"[ERROR] Download failed: {e}")
+    if not download_url:
+        print("[FATAL] Model file missing: models/best_densenet121.keras")
+        print("[FATAL] MODEL_DOWNLOAD_URL environment variable is not set!")
+        print("Please configure MODEL_DOWNLOAD_URL in your cloud deployment environment settings.")
+        return False
 
-    return model_present and thresh_present
+    download_url = download_url.strip()
+    print(f"[DOWNLOAD] Fetching model from: {download_url} ...")
+
+    temp_path = MODEL_PATH + ".downloading"
+    try:
+        import requests
+        headers = {"User-Agent": "MEDIC-XAI-Model-Provisioner/1.0"}
+        with requests.get(download_url, headers=headers, stream=True, allow_redirects=True, timeout=120) as r:
+            r.raise_for_status()
+            total_downloaded = 0
+            with open(temp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        total_downloaded += len(chunk)
+                        print(f"  Downloaded: {total_downloaded / (1024*1024):.1f} MB ...", end="\r")
+
+            print()
+
+        # Verify downloaded file size
+        actual_size = os.path.getsize(temp_path)
+        if actual_size < EXPECTED_MIN_SIZE_BYTES:
+            print(f"[ERROR] Downloaded file is too small ({actual_size} bytes). Expected at least {EXPECTED_MIN_SIZE_BYTES} bytes.")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False
+
+        # Atomically rename to final model path
+        if os.path.exists(MODEL_PATH):
+            os.remove(MODEL_PATH)
+        os.rename(temp_path, MODEL_PATH)
+
+        size_mb = actual_size / (1024 * 1024)
+        print(f"[SUCCESS] Downloaded and verified model: {MODEL_PATH} ({size_mb:.2f} MB)")
+        return True
+
+    except Exception as e:
+        print(f"[ERROR] Model download failed: {e}")
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        return False
 
 if __name__ == "__main__":
-    success = check_model()
+    success = check_and_provision_model()
     sys.exit(0 if success else 1)
