@@ -23,6 +23,7 @@ import os
 import io
 import csv
 import base64
+import threading
 import numpy as np
 import matplotlib.cm as cm
 from PIL import Image
@@ -117,30 +118,44 @@ def load_thresholds(csv_path):
                 labels.append((name, thresh))
     return labels
 
+_MODEL_LOCK = threading.Lock()
+
+def ensure_model_loaded():
+    """
+    Thread-safe lazy initialization ensuring DenseNet121 and Grad-CAM
+    are loaded inside the active worker process, avoiding POSIX fork deadlocks.
+    """
+    global MODEL
+    if MODEL is None:
+        with _MODEL_LOCK:
+            if MODEL is None:
+                init_model()
+
 def init_model():
     global MODEL, MODEL_PATH_LOADED, LABELS_DATA, LABELS_DICT, GRAD_CAM_MODEL
     model_file = resolve_file(MODEL_CANDIDATES)
     thresh_file = resolve_file(THRESHOLDS_CANDIDATES)
 
     if not thresh_file:
-        print("[WARNING] Could not locate optimal_thresholds.csv!")
+        print("[WARNING] Could not locate optimal_thresholds.csv!", flush=True)
     else:
-        print(f"[INIT] Loading optimal thresholds from: {thresh_file}")
+        print(f"[INIT] Loading optimal thresholds from: {thresh_file}", flush=True)
         LABELS_DATA = load_thresholds(thresh_file)
         LABELS_DICT = {name: thresh for name, thresh in LABELS_DATA}
-        print(f"[INIT] Loaded {len(LABELS_DATA)} labels and thresholds.")
+        print(f"[INIT] Loaded {len(LABELS_DATA)} labels and thresholds.", flush=True)
 
     if not model_file:
-        print("[WARNING] Could not locate best_densenet121.keras!")
+        print("[WARNING] Could not locate best_densenet121.keras!", flush=True)
         return
 
-    print(f"[INIT] Loading DenseNet121 model from: {model_file} ...")
+    pid = os.getpid()
+    print(f"[INIT] Loading DenseNet121 model in worker PID {pid} from: {model_file} ...", flush=True)
     t0 = time.time()
     try:
         MODEL = keras.models.load_model(model_file, compile=False)
         MODEL_PATH_LOADED = model_file
-        print(f"[INIT] Model loaded successfully in {time.time()-t0:.2f}s!")
-        print(f"[INIT] Input shape: {MODEL.input_shape}, Output shape: {MODEL.output_shape}")
+        print(f"[INIT] Model loaded successfully in {time.time()-t0:.2f}s in PID {pid}!", flush=True)
+        print(f"[INIT] Input shape: {MODEL.input_shape}, Output shape: {MODEL.output_shape}", flush=True)
 
         # Construct and cache the Grad-CAM sub-model targeting conv5_block16_2_conv
         try:
@@ -150,17 +165,20 @@ def init_model():
                 inputs=dense_sub.input,
                 outputs=[target_conv.output, dense_sub.output]
             )
-            print(f"[INIT] Grad-CAM model created targeting layer '{TARGET_LAYER_NAME}' (output shape: {target_conv.output.shape})!")
+            print(f"[INIT] Grad-CAM model created targeting layer '{TARGET_LAYER_NAME}' (output shape: {target_conv.output.shape})!", flush=True)
         except Exception as e_cam:
-            print(f"[WARNING] Could not initialize Grad-CAM sub-model: {e_cam}")
+            print(f"[WARNING] Could not initialize Grad-CAM sub-model: {e_cam}", flush=True)
             GRAD_CAM_MODEL = None
     except Exception as e:
-        print(f"[ERROR] Failed to load model: {e}")
+        print(f"[ERROR] Failed to load model: {e}", flush=True)
         MODEL = None
         GRAD_CAM_MODEL = None
 
-# Initialize model, thresholds, and Grad-CAM sub-model once at server startup
-init_model()
+# Preload thresholds at startup (fast CSV read, zero thread footprint)
+_thresh_file = resolve_file(THRESHOLDS_CANDIDATES)
+if _thresh_file:
+    LABELS_DATA = load_thresholds(_thresh_file)
+    LABELS_DICT = {name: thresh for name, thresh in LABELS_DATA}
 
 # =========================================================================
 # ORGAN-SPECIFIC LABEL GROUPS (Exact Specification)
@@ -513,7 +531,9 @@ def allowed_file(filename):
 def health_check():
     """
     Health check endpoint returning real model status.
+    Guarantees model is initialized inside active worker process.
     """
+    ensure_model_loaded()
     return jsonify({
         "status": "online",
         "service": "MEDIC-XAI Flask Machine Learning Backend",
@@ -543,6 +563,7 @@ def analyze():
     6. Filter displayed abnormalities strictly to that organ's pathologies
     7. Return standardized JSON response with organ and organ_confidence
     """
+    ensure_model_loaded()
     start_time = time.time()
     origin = request.headers.get('Origin', 'N/A')
     print(f"[ANALYZE] request received - method={request.method}, origin={origin}", flush=True)
