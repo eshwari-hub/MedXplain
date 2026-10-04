@@ -2,6 +2,8 @@
 
 import { PRESET_CASES } from '../data/sampleData';
 
+const LIVE_RENDER_BACKEND = 'https://medxplain-rlwd.onrender.com';
+
 function resolveInitialBackendUrl() {
   const envUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) 
     ? String(import.meta.env.VITE_API_URL).trim().replace(/\/+$/, '') 
@@ -29,7 +31,7 @@ function resolveInitialBackendUrl() {
 
   if (stored) return stored.replace(/\/+$/, '');
   if (envUrl) return envUrl;
-  return isLocalHost ? 'http://127.0.0.1:5000' : '';
+  return isLocalHost ? 'http://127.0.0.1:5000' : LIVE_RENDER_BACKEND;
 }
 
 class MedicalAIService {

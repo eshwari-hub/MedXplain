@@ -1,0 +1,14 @@
+# Exclude Python backend and models from Vercel frontend build
+# Backend is deployed on Render, not Vercel
+requirements.txt
+backend_sample/
+models/
+scripts/
+tests/
+wsgi.py
+Procfile
+render.yaml
+*.py
+__pycache__/
+*.keras
+*.csv

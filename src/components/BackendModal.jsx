@@ -31,11 +31,11 @@ export function BackendModal({ isOpen, onClose }) {
   -F "file=@chest_scan.png" \\
   -F "organ_mode=chest"`;
 
-  const samplePython = `# Run the starter Flask backend:
-python backend_sample/app.py
+  const samplePython = `# Production Render backend:
+# https://medxplain-rlwd.onrender.com/api/analyze
 
-# Accessible at:
-# http://127.0.0.1:5000/api/analyze`;
+# Or local development:
+# python wsgi.py`;
 
   const expectedResponse = `{
   "success": true,
@@ -83,7 +83,7 @@ python backend_sample/app.py
                 value={backendUrl} 
                 onChange={(e) => setBackendUrl(e.target.value)}
                 className="input-glass flex-1 mono text-sm"
-                placeholder="http://127.0.0.1:5000"
+                placeholder="https://medxplain-rlwd.onrender.com"
               />
               <button 
                 className="btn btn-secondary btn-sm"
