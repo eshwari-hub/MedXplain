@@ -61,7 +61,7 @@ class MedicalAIService {
     }
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s health check timeout
       const res = await fetch(`${this.backendUrl}/api/health`, {
         signal: controller.signal
       });
@@ -108,8 +108,10 @@ class MedicalAIService {
     formData.append('file', actualFile);
     formData.append('organ_mode', organMode || 'auto');
 
+    // Production analysis timeout: 180 seconds for DenseNet121 + Grad-CAM inference
+    const ANALYSIS_TIMEOUT_MS = 180000;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35000); // 35s timeout for deep learning computation
+    const timeoutId = setTimeout(() => controller.abort(), ANALYSIS_TIMEOUT_MS);
 
     onProgress(2, "Detecting Organ (Brain MRI / Chest X-Ray / Bone X-Ray)...", 40);
 

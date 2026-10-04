@@ -35,19 +35,23 @@ import keras
 app = Flask(__name__)
 
 # Configure CORS: support environment-driven origins for public production deployments
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://med-xplain-two.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:5175"
+]
+
 cors_origins_env = os.environ.get('CORS_ORIGINS') or os.environ.get('FRONTEND_URL')
+allowed_origins = list(DEFAULT_ALLOWED_ORIGINS)
 if cors_origins_env:
-    allowed_origins = [orig.strip() for orig in cors_origins_env.split(',') if orig.strip()]
-else:
-    allowed_origins = [
-        "http://localhost:5175",
-        "http://localhost:5174",
-        "http://localhost:5173",
-        "http://127.0.0.1:5175",
-        "http://127.0.0.1:5174",
-        "http://127.0.0.1:5173",
-        "*"
-    ]
+    for orig in cors_origins_env.split(','):
+        clean_orig = orig.strip().rstrip('/')
+        if clean_orig and clean_orig not in allowed_origins:
+            allowed_origins.append(clean_orig)
 
 CORS(app, resources={
     r"/api/*": {
@@ -462,10 +466,18 @@ def compute_gradcam_overlay(pil_img, preprocessed_batch, target_class_index, tar
         else:
             normalized_cam = np.zeros_like(cam)
 
-        # 7. Resize heatmap to original image dimensions with bicubic interpolation
+        # 7. Resize heatmap to image dimensions with bicubic interpolation (capped at 1024 to prevent memory exhaustion)
         orig_w, orig_h = pil_img.size
+        max_dim = 1024
+        if max(orig_w, orig_h) > max_dim:
+            scale = max_dim / float(max(orig_w, orig_h))
+            target_w = max(1, int(orig_w * scale))
+            target_h = max(1, int(orig_h * scale))
+        else:
+            target_w, target_h = orig_w, orig_h
+
         heatmap_pil = Image.fromarray((normalized_cam * 255.0).astype(np.uint8))
-        heatmap_resized = heatmap_pil.resize((orig_w, orig_h), Image.Resampling.BICUBIC)
+        heatmap_resized = heatmap_pil.resize((target_w, target_h), Image.Resampling.BICUBIC)
         heatmap_arr = np.array(heatmap_resized, dtype=np.float32) / 255.0
 
         # 8. Apply Jet colormap
@@ -479,6 +491,8 @@ def compute_gradcam_overlay(pil_img, preprocessed_batch, target_class_index, tar
 
         # 9. Blend heatmap with original image (alpha = 0.45)
         orig_rgb = pil_img.convert('RGB')
+        if (orig_w, orig_h) != (target_w, target_h):
+            orig_rgb = orig_rgb.resize((target_w, target_h), Image.Resampling.BILINEAR)
         overlay_pil = Image.blend(orig_rgb, colored_pil, alpha=0.45)
 
         # 10. Encode as Base64 data URI
@@ -530,6 +544,8 @@ def analyze():
     7. Return standardized JSON response with organ and organ_confidence
     """
     start_time = time.time()
+    origin = request.headers.get('Origin', 'N/A')
+    print(f"[ANALYZE] request received - method={request.method}, origin={origin}", flush=True)
 
     # 1. Validate file presence
     if 'file' not in request.files:
@@ -566,6 +582,7 @@ def analyze():
     # 4. Ingest and parse uploaded medical image
     try:
         image_bytes = uploaded_file.read()
+        print(f"[ANALYZE] image received - filename='{uploaded_file.filename}', size={len(image_bytes)} bytes", flush=True)
         if len(image_bytes) == 0:
             return jsonify({
                 "success": False,
@@ -581,6 +598,7 @@ def analyze():
         pil_img = Image.open(io.BytesIO(image_bytes))
         pil_img.verify()
         pil_img = Image.open(io.BytesIO(image_bytes))
+        print(f"[ANALYZE] image validation passed - format={pil_img.format}, size={pil_img.size}, mode={pil_img.mode}", flush=True)
     except Exception:
         return jsonify({
             "success": False,
@@ -614,18 +632,19 @@ def analyze():
         analysis_mode = target_organ
 
     # Log detected organ details for auditability
-    print(f"[ORGAN DETECTION]\nDetected organ: {target_organ}\nConfidence: {organ_confidence}\nModality: {modality}")
+    print(f"[ORGAN DETECTION] Detected organ: {target_organ}, Confidence: {organ_confidence}, Modality: {modality}", flush=True)
 
     # STAGE 2: Run inference with real unified DenseNet121 model (60 sigmoid outputs)
     try:
+        print("[ANALYZE] model inference started (DenseNet121 unified 60-class)", flush=True)
         # Preprocessing: convert to RGB -> resize to 224x224 -> densenet.preprocess_input
         resized_img = pil_img.convert('RGB').resize((224, 224), Image.Resampling.BILINEAR)
         img_array = np.array(resized_img, dtype=np.float32)
         img_batch = np.expand_dims(img_array, axis=0)
         preprocessed_batch = tf.keras.applications.densenet.preprocess_input(img_batch)
-        raw_predictions = MODEL.predict(preprocessed_batch, verbose=0)[0]
+        raw_predictions = MODEL(preprocessed_batch, training=False).numpy()[0]
     except Exception as e:
-        print(f"[INFERENCE ERROR] {e}")
+        print(f"[INFERENCE ERROR] {e}", flush=True)
         return jsonify({
             "success": False,
             "error": "Model inference execution failed. Please verify the uploaded image format."
@@ -699,6 +718,7 @@ def analyze():
     cam_err = None
 
     if target_class_index is not None:
+        print(f"[ANALYZE] Grad-CAM started - layer='{cam_layer}', target='{cam_target}'", flush=True)
         gradcam_data_uri, cam_target, cam_layer, cam_err = compute_gradcam_overlay(
             pil_img, preprocessed_batch, target_class_index, gradcam_target_name
         )
@@ -706,6 +726,9 @@ def analyze():
         cam_err = "Target class index not found in model outputs"
 
     elapsed_time = round(time.time() - start_time, 3)
+    top_pred_name = top_predictions[0]['name'] if top_predictions else 'None'
+    print(f"[ANALYZE] response generated - organ='{target_organ}', confidence={organ_confidence}, detected_abnormalities={len(filtered_abnormalities)}, top_prediction='{top_pred_name}'", flush=True)
+    print(f"[ANALYZE] total processing time: {elapsed_time}s", flush=True)
 
     # 10. Return JSON response strictly formatted as required
     response_payload = {
