@@ -18,8 +18,14 @@ contains only pathologies belonging to the target organ.
 =============================================================================
 """
 
-import time
 import os
+# Configure single-thread CPU execution before TensorFlow import to prevent thread contention & memory spikes
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+import time
 import io
 import csv
 import base64
@@ -32,6 +38,13 @@ from flask_cors import CORS
 
 import tensorflow as tf
 import keras
+
+# Configure TensorFlow single-thread execution for CPU environments (Render, Linux container)
+try:
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+except Exception as e_th:
+    print(f"[INIT] Threading configuration note: {e_th}", flush=True)
 
 app = Flask(__name__)
 
@@ -176,6 +189,15 @@ def init_model():
         except Exception as e_cam:
             print(f"[WARNING] Could not initialize Grad-CAM sub-model: {e_cam}", flush=True)
             GRAD_CAM_MODEL = None
+
+        # Warmup forward pass: runs one inference to initialize JIT kernels, C++ buffers & weights once at startup
+        try:
+            t_warm = time.time()
+            dummy_batch = np.zeros((1, 224, 224, 3), dtype=np.float32)
+            _ = MODEL(dummy_batch, training=False)
+            print(f"[INIT] Model warmed up with single-thread forward pass in {time.time()-t_warm:.2f}s!", flush=True)
+        except Exception as e_warm:
+            print(f"[WARNING] Model warmup exception: {e_warm}", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to load model: {e}", flush=True)
         MODEL = None
@@ -680,14 +702,26 @@ def analyze():
 
         t_infer_start = time.time()
         print(f"[TIMING] MODEL(batch, training=False) started at {t_infer_start:.3f}", flush=True)
-        raw_predictions = MODEL(preprocessed_batch, training=False).numpy()[0]
-        t_infer_end = time.time()
-        print(f"[TIMING] MODEL(batch, training=False) completed in {t_infer_end - t_infer_start:.3f}s", flush=True)
+        try:
+            preds_tensor = MODEL(preprocessed_batch, training=False)
+            raw_predictions = preds_tensor.numpy()[0]
+            t_infer_end = time.time()
+            print(f"[TIMING] MODEL(batch, training=False) completed in {t_infer_end - t_infer_start:.3f}s", flush=True)
+        except Exception as e_inf:
+            print(f"[INFERENCE EXCEPTION] {type(e_inf).__name__}: {e_inf}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                "success": False,
+                "error": f"Model inference failed at runtime: {type(e_inf).__name__}: {e_inf}",
+                "stage": "model_inference"
+            }), 500
     except Exception as e:
-        print(f"[INFERENCE ERROR] {e}", flush=True)
+        print(f"[STAGE 2 ERROR] {type(e).__name__}: {e}", flush=True)
         return jsonify({
             "success": False,
-            "error": "Model inference execution failed. Please verify the uploaded image format."
+            "error": f"Preprocessing or execution failed: {type(e).__name__}: {e}",
+            "stage": "preprocessing"
         }), 500
 
     # Map all 60 raw probabilities and optimal thresholds

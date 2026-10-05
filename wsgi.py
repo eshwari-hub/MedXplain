@@ -6,6 +6,12 @@ Compatible with Gunicorn, uWSGI, Render, Railway, Heroku, AWS Elastic Beanstalk,
 import os
 import sys
 
+# Configure single-thread CPU execution before TensorFlow import to prevent thread contention & memory spikes
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
 # Ensure current and parent directories are in python search path
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
