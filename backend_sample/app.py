@@ -30,7 +30,10 @@ import io
 import csv
 import base64
 import threading
+import gc
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.cm as cm
 from PIL import Image
 from flask import Flask, request, jsonify
@@ -175,21 +178,12 @@ def init_model():
         print(f"[INIT] Model loaded successfully in {time.time()-t0:.2f}s in PID {pid}!", flush=True)
         print(f"[INIT] Input shape: {MODEL.input_shape}, Output shape: {MODEL.output_shape}", flush=True)
 
-        # Construct and cache the Grad-CAM sub-model targeting conv5_block16_2_conv
-        try:
-            dense_sub = MODEL.get_layer('densenet121')
-            target_conv = dense_sub.get_layer(TARGET_LAYER_NAME)
-            GRAD_CAM_MODEL = keras.models.Model(
-                inputs=dense_sub.input,
-                outputs=[target_conv.output, dense_sub.output]
-            )
-            GAP_LAYER = MODEL.get_layer('global_average_pooling2d')
-            DROPOUT_LAYER = MODEL.get_layer('dropout')
-            CLASSIFIER_LAYER = MODEL.get_layer('disease_outputs')
-            print(f"[INIT] Grad-CAM model created targeting layer '{TARGET_LAYER_NAME}' (output shape: {target_conv.output.shape})!", flush=True)
-        except Exception as e_cam:
-            print(f"[WARNING] Could not initialize Grad-CAM sub-model: {e_cam}", flush=True)
-            GRAD_CAM_MODEL = None
+        # Grad-CAM sub-model construction deferred during diagnostic isolation test to minimize RAM
+        GRAD_CAM_MODEL = None
+        GAP_LAYER = None
+        DROPOUT_LAYER = None
+        CLASSIFIER_LAYER = None
+        print("[INIT] Diagnostic isolation: Grad-CAM sub-model construction bypassed to conserve memory", flush=True)
 
         # Warmup forward pass: runs one inference to initialize JIT kernels, C++ buffers & weights once at startup
         try:
@@ -197,6 +191,8 @@ def init_model():
             dummy_batch = np.zeros((1, 224, 224, 3), dtype=np.float32)
             with _INFERENCE_LOCK:
                 _ = MODEL(dummy_batch, training=False)
+            del dummy_batch
+            gc.collect()
             print(f"[INIT] Model warmed up with single-thread forward pass in {time.time()-t_warm:.2f}s!", flush=True)
         except Exception as e_warm:
             print(f"[WARNING] Model warmup exception: {e_warm}", flush=True)
@@ -719,6 +715,15 @@ def analyze():
                 "error": f"Model inference failed at runtime: {type(e_inf).__name__}: {e_inf}",
                 "stage": "model_inference"
             }), 500
+        finally:
+            try:
+                del preprocessed_batch
+                del img_batch
+                del img_array
+                del resized_img
+                gc.collect()
+            except Exception:
+                pass
     except Exception as e:
         print(f"[STAGE 2 ERROR] {type(e).__name__}: {e}", flush=True)
         return jsonify({
@@ -807,7 +812,7 @@ def analyze():
         "all_probabilities": all_probabilities,
         "all_thresholds": all_thresholds,
         "grad_cam_image": None,
-        "gradcam_status": "disabled_for_production_test",
+        "gradcam_status": "disabled_for_diagnostic_test",
         "grad_cam_target": cam_target,
         "grad_cam_layer": cam_layer,
         "grad_cam_error": None,
