@@ -132,6 +132,7 @@ def load_thresholds(csv_path):
     return labels
 
 _MODEL_LOCK = threading.Lock()
+_INFERENCE_LOCK = threading.Lock()
 
 def ensure_model_loaded():
     """
@@ -194,7 +195,8 @@ def init_model():
         try:
             t_warm = time.time()
             dummy_batch = np.zeros((1, 224, 224, 3), dtype=np.float32)
-            _ = MODEL(dummy_batch, training=False)
+            with _INFERENCE_LOCK:
+                _ = MODEL(dummy_batch, training=False)
             print(f"[INIT] Model warmed up with single-thread forward pass in {time.time()-t_warm:.2f}s!", flush=True)
         except Exception as e_warm:
             print(f"[WARNING] Model warmup exception: {e_warm}", flush=True)
@@ -703,8 +705,9 @@ def analyze():
         t_infer_start = time.time()
         print(f"[TIMING] MODEL(batch, training=False) started at {t_infer_start:.3f}", flush=True)
         try:
-            preds_tensor = MODEL(preprocessed_batch, training=False)
-            raw_predictions = preds_tensor.numpy()[0]
+            with _INFERENCE_LOCK:
+                preds_tensor = MODEL(preprocessed_batch, training=False)
+                raw_predictions = preds_tensor.numpy()[0]
             t_infer_end = time.time()
             print(f"[TIMING] MODEL(batch, training=False) completed in {t_infer_end - t_infer_start:.3f}s", flush=True)
         except Exception as e_inf:
